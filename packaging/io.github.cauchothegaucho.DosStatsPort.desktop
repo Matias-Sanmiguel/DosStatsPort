@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=DIS Estadistica
+Comment=Distribuciones estadisticas para la facultad
+Exec=dis-estadistica
+Icon=dis-estadistica
+Terminal=false
+Categories=Education;Math;
+StartupNotify=true

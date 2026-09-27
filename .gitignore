@@ -1,0 +1,14 @@
+.cache/
+build/
+dist/
+input/
+*.AppImage
+*.tar.xz
+*.zip
+*.exe
+*.EXE
+*.com
+*.COM
+.env
+.env.*
+!.env.example

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.cauchothegaucho.DosStatsPort</id>
+  <name>DIS Estadistica</name>
+  <summary>Distribuciones estadisticas para la facultad</summary>
+  <metadata_license>MIT</metadata_license>
+  <project_license>LicenseRef-proprietary AND MIT AND GPL-2.0-or-later</project_license>
+  <description>
+    <p>Ejecuta el programa academico DIS de 1995 en un entorno DOS aislado, reproducible y portable para Linux x86_64.</p>
+    <p>Incluye una configuracion validada de DOSBox Staging y conserva los datos de la aplicacion dentro de directorios XDG privados.</p>
+  </description>
+  <launchable type="desktop-id">io.github.cauchothegaucho.DosStatsPort.desktop</launchable>
+  <developer id="io.github.cauchothegaucho">
+    <name>DosStatsPort contributors</name>
+  </developer>
+  <url type="homepage">https://github.com/Matias-Sanmiguel/DosStatsPort</url>
+  <content_rating type="oars-1.1"/>
+  <provides>
+    <binary>dis-estadistica</binary>
+  </provides>
+</component>

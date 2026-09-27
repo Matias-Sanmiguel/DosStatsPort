@@ -1,0 +1,297 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly APP_NAME="DIS Estadistica"
+readonly APP_ID="dis-estadistica"
+
+die() {
+    printf '%s: %s\n' "$APP_NAME" "$*" >&2
+    exit 1
+}
+
+info() {
+    printf '%s: %s\n' "$APP_NAME" "$*" >&2
+}
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+app_root=${DIS_APP_ROOT:-$(CDPATH= cd -- "$script_dir/../.." && pwd)}
+share_dir="$app_root/usr/share/$APP_ID"
+payload_dir="$share_dir/payload"
+payload_manifest="$payload_dir/payload.sha256"
+dosbox_home="$app_root/usr/lib/dosbox-staging"
+dosbox_bin=${DIS_DOSBOX_BIN:-$dosbox_home/dosbox}
+dosbox_conf="$share_dir/dosbox.conf"
+
+data_root=${DIS_DATA_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/$APP_ID}
+config_root=${DIS_CONFIG_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/$APP_ID}
+state_root=${DIS_STATE_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/$APP_ID}
+runtime_root=${DIS_RUNTIME_HOME:-${XDG_RUNTIME_DIR:-$state_root}/$APP_ID}
+drive_c="$data_root/drive_c"
+drive_new="$data_root/drive_c.new"
+drive_backup="$data_root/drive_c.backup"
+journal="$data_root/migration.journal"
+settings_file="$config_root/settings.conf"
+capture_dir="$state_root/capture"
+mapper_file="$state_root/mapper-sdl2-0.83.0.map"
+lock_file="$runtime_root/session.lock"
+
+prepare_only=0
+repair=0
+reset_data=0
+assume_yes=0
+allow_downgrade=0
+
+usage() {
+    cat <<'EOF'
+Uso: dis-estadistica [opcion]
+
+Sin opciones          Ejecuta DIS.
+  --prepare-only      Prepara y valida el disco C sin abrir DOSBox.
+  --repair            Reinstala los archivos administrados y conserva un backup.
+  --reset-data        Elimina datos y configuracion propios de la aplicacion.
+  --yes               Confirma --reset-data sin prompt (solo para automatizacion).
+  --allow-downgrade   Permite instalar un payload de version anterior.
+  --version           Muestra la version del paquete.
+  -h, --help          Muestra esta ayuda.
+EOF
+}
+
+while (($#)); do
+    case "$1" in
+        --prepare-only) prepare_only=1 ;;
+        --repair) repair=1 ;;
+        --reset-data) reset_data=1 ;;
+        --yes) assume_yes=1 ;;
+        --allow-downgrade) allow_downgrade=1 ;;
+        --version)
+            cat "$share_dir/VERSION"
+            exit 0
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            usage >&2
+            die "opcion desconocida: $1"
+            ;;
+    esac
+    shift
+done
+
+[[ $(uname -m) == x86_64 ]] || die "esta version requiere Linux x86_64"
+[[ -d $payload_dir && -f $payload_manifest ]] || die "payload ausente en $payload_dir"
+[[ -x $dosbox_bin ]] || die "DOSBox Staging ausente o no ejecutable: $dosbox_bin"
+[[ -f $dosbox_conf ]] || die "configuracion ausente: $dosbox_conf"
+command -v flock >/dev/null 2>&1 || die "se requiere 'flock' (util-linux)"
+command -v sha256sum >/dev/null 2>&1 || die "se requiere 'sha256sum'"
+
+umask 077
+mkdir -p "$data_root" "$config_root" "$state_root" "$capture_dir" "$runtime_root"
+exec 9>"$lock_file"
+flock -n 9 || die "ya hay otra instancia o tarea de mantenimiento en ejecucion"
+
+manifest_version() {
+    local manifest=$1
+    local version
+    version=$(while IFS='=' read -r key value; do
+        [[ $key == payload_version ]] && printf '%s' "$value"
+    done < "$manifest")
+    [[ $version =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$version"
+}
+
+manifest_hashes() {
+    while IFS= read -r line; do
+        [[ $line =~ ^[0-9a-f]{64}[[:space:]][[:space:]][A-Z0-9.]+$ ]] && printf '%s\n' "$line"
+    done < "$1"
+}
+
+validate_drive() {
+    local dir=$1
+    local manifest="$dir/.dis-payload-manifest"
+    [[ -d $dir && -f $manifest ]] || return 1
+    manifest_version "$manifest" >/dev/null || return 1
+    (cd "$dir" && manifest_hashes "$manifest" | sha256sum --check --status -) || return 1
+}
+
+validate_packaged_payload() {
+    manifest_version "$payload_manifest" >/dev/null || die "manifiesto de payload invalido"
+    (cd "$payload_dir" && manifest_hashes "$payload_manifest" | sha256sum --check --status -) || \
+        die "el payload empaquetado no coincide con sus hashes"
+}
+
+sync_tree() {
+    sync -f "$1" 2>/dev/null || sync
+}
+
+write_journal() {
+    printf 'phase=%s\n' "$1" > "$journal"
+    sync_tree "$data_root"
+}
+
+recover_migration() {
+    [[ -e $journal || -e $drive_new ]] || return 0
+    info "recuperando una migracion interrumpida"
+
+    if validate_drive "$drive_c"; then
+        rm -rf -- "$drive_new"
+    elif validate_drive "$drive_new"; then
+        [[ ! -e $drive_c ]] || rm -rf -- "$drive_c"
+        mv -- "$drive_new" "$drive_c"
+    elif validate_drive "$drive_backup"; then
+        [[ ! -e $drive_c ]] || rm -rf -- "$drive_c"
+        [[ ! -e $drive_new ]] || rm -rf -- "$drive_new"
+        mv -- "$drive_backup" "$drive_c"
+    else
+        die "no se pudo recuperar drive_c; ejecute --repair"
+    fi
+    rm -f -- "$journal"
+    sync_tree "$data_root"
+}
+
+copy_packaged_payload() {
+    local target=$1
+    mkdir -p "$target"
+    while read -r _hash filename; do
+        install -m 0600 "$payload_dir/$filename" "$target/$filename"
+    done < <(manifest_hashes "$payload_manifest")
+    install -m 0600 "$payload_manifest" "$target/.dis-payload-manifest"
+}
+
+fresh_install() {
+    rm -rf -- "$drive_new"
+    copy_packaged_payload "$drive_new"
+    validate_drive "$drive_new" || die "fallo la validacion del nuevo disco C"
+    sync_tree "$drive_new"
+    write_journal prepared
+    mv -- "$drive_new" "$drive_c"
+    rm -f -- "$journal"
+    sync_tree "$data_root"
+}
+
+replace_payload() {
+    local force=$1
+    local installed_manifest="$drive_c/.dis-payload-manifest"
+    local packaged_version installed_version
+
+    packaged_version=$(manifest_version "$payload_manifest") || die "version empaquetada invalida"
+    installed_version=$(manifest_version "$installed_manifest" 2>/dev/null || printf '0')
+    if ((packaged_version < installed_version && !allow_downgrade)); then
+        die "payload instalado v$installed_version es mas nuevo que v$packaged_version; use --allow-downgrade"
+    fi
+    if ((!force)) && ! validate_drive "$drive_c"; then
+        die "los archivos administrados fueron modificados; ejecute --repair"
+    fi
+
+    rm -rf -- "$drive_new"
+    cp -a -- "$drive_c" "$drive_new"
+    if [[ -f $installed_manifest ]]; then
+        while read -r _hash filename; do
+            rm -f -- "$drive_new/$filename"
+        done < <(manifest_hashes "$installed_manifest")
+    fi
+    copy_packaged_payload "$drive_new"
+    validate_drive "$drive_new" || die "fallo la validacion de la actualizacion"
+    sync_tree "$drive_new"
+
+    write_journal prepared
+    rm -rf -- "$drive_backup"
+    mv -- "$drive_c" "$drive_backup"
+    write_journal rotated
+    mv -- "$drive_new" "$drive_c"
+    write_journal promoted
+    rm -f -- "$journal"
+    sync_tree "$data_root"
+}
+
+prepare_drive() {
+    validate_packaged_payload
+    recover_migration
+
+    if [[ ! -e $drive_c ]]; then
+        fresh_install
+        return
+    fi
+
+    if ((repair)); then
+        replace_payload 1
+        return
+    fi
+
+    local installed_manifest="$drive_c/.dis-payload-manifest"
+    if [[ -f $installed_manifest ]] && cmp -s "$installed_manifest" "$payload_manifest"; then
+        validate_drive "$drive_c" || die "el disco C esta corrupto; ejecute --repair"
+        return
+    fi
+    replace_payload 0
+}
+
+reset_application_data() {
+    local answer
+    if ((!assume_yes)); then
+        [[ -t 0 ]] || die "--reset-data requiere confirmacion; use --yes en automatizacion"
+        printf 'Se eliminaran:\n  %s\n  %s\n  %s\nContinuar? [y/N] ' "$data_root" "$config_root" "$state_root" >&2
+        read -r answer
+        [[ $answer == y || $answer == Y ]] || die "operacion cancelada"
+    fi
+    rm -rf -- "$data_root" "$config_root" "$state_root"
+    info "datos eliminados"
+}
+
+if ((reset_data)); then
+    reset_application_data
+    exit 0
+fi
+
+prepare_drive
+if ((prepare_only)); then
+    info "disco C preparado en $drive_c"
+    exit 0
+fi
+
+fullscreen=off
+window_size=large
+keyboard_layout="la 850"
+if [[ -f $settings_file ]]; then
+    while IFS='=' read -r key value; do
+        [[ -z $key || $key == \#* ]] && continue
+        case "$key" in
+            fullscreen)
+                [[ $value == on || $value == off ]] || die "fullscreen invalido en $settings_file"
+                fullscreen=$value
+                ;;
+            window_size)
+                [[ $value =~ ^(default|small|medium|large)$ ]] || die "window_size invalido en $settings_file"
+                window_size=$value
+                ;;
+            keyboard_layout)
+                [[ $value =~ ^(auto|la(\ 850)?|sp(\ 850)?)$ ]] || die "keyboard_layout invalido en $settings_file"
+                keyboard_layout=$value
+                ;;
+            *) die "preferencia no permitida '$key' en $settings_file" ;;
+        esac
+    done < "$settings_file"
+fi
+
+export LD_LIBRARY_PATH="$dosbox_home/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+set +e
+"$dosbox_bin" \
+    --noprimaryconf \
+    --nolocalconf \
+    --working-dir "$drive_c" \
+    --conf "$dosbox_conf" \
+    --set "fullscreen=$fullscreen" \
+    --set "window_size=$window_size" \
+    --set "keyboard_layout=$keyboard_layout" \
+    --set "capture_dir=$capture_dir" \
+    --set "mapperfile=$mapper_file" \
+    "$drive_c/DIS.EXE"
+status=$?
+set -e
+
+if ((status == 0)) && [[ -d $drive_backup ]]; then
+    rm -rf -- "$drive_backup"
+    sync_tree "$data_root"
+fi
+exit "$status"

@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install metadata validators
+        run: sudo apt-get update && sudo apt-get install --yes appstream desktop-file-utils
+
+      - name: Validate shell syntax
+        run: bash -n scripts/build-linux.sh scripts/test.sh src/dis-estadistica src/AppRun
+
+      - name: Run synthetic launcher tests
+        run: ./scripts/test.sh
+
+      - name: Validate desktop entry
+        run: desktop-file-validate packaging/io.github.cauchothegaucho.DosStatsPort.desktop
+
+      - name: Validate AppStream metadata
+        run: appstreamcli validate --no-net packaging/io.github.cauchothegaucho.DosStatsPort.appdata.xml
